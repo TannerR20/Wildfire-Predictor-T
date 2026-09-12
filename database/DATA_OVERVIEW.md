@@ -1,4 +1,4 @@
-NOTE: These are not the complete datasets but onlys subsets (20000 rows) as githb limits to 25 MB uploads.
+NOTE: These are not the complete datasets but onlys subsets (20000 rows) as github limits to 25 MB uploads.
 
 raw:
  - Fires: Raw data from https://research.fs.usda.gov/firelab/products/dataandtools/us-wildfires
