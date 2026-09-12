@@ -1,0 +1,97 @@
+"?column?"
+"CREATE OR REPLACE VIEW model.wildfire_prediction_view AS  SELECT g.grid_id,
+    d.prediction_date,
+    EXTRACT(year FROM d.prediction_date)::smallint AS year,
+    EXTRACT(month FROM d.prediction_date)::smallint AS month,
+    EXTRACT(doy FROM d.prediction_date)::smallint AS day_of_year,
+    sin(2.0::double precision * pi() * EXTRACT(doy FROM d.prediction_date)::double precision / 365.25::double precision) AS sin_day_of_year,
+    cos(2.0::double precision * pi() * EXTRACT(doy FROM d.prediction_date)::double precision / 365.25::double precision) AS cos_day_of_year,
+    ws.station_id AS weather_station_id,
+    ws.distance_km AS weather_station_distance_km,
+    w.prcp_mm,
+    w.tmax_c,
+    w.tmin_c,
+        CASE
+            WHEN w.tmax_c IS NOT NULL AND w.tmin_c IS NOT NULL THEN w.tmax_c - w.tmin_c
+            ELSE NULL::numeric
+        END AS temp_range_c,
+    w.prcp_7d_mm,
+    w.prcp_obs_7d,
+    w.prcp_30d_mm,
+    w.prcp_obs_30d,
+    w.tmax_7d_avg_c,
+    w.tmin_7d_avg_c,
+    w.dry_days_7d,
+    dr.drought_date,
+    dr.drought_value,
+        CASE dr.drought_value
+            WHEN '-1'::integer THEN 'No Drought'::text
+            WHEN 0 THEN 'D0'::text
+            WHEN 1 THEN 'D1'::text
+            WHEN 2 THEN 'D2'::text
+            WHEN 3 THEN 'D3'::text
+            WHEN 4 THEN 'D4'::text
+            ELSE NULL::text
+        END AS drought_category,
+    lc.year AS landcover_year,
+    lc.forest_pct,
+    lc.shrub_pct,
+    lc.grassland_pct,
+    lc.cropland_pct,
+    lc.pasture_pct,
+    lc.developed_pct,
+    lc.barren_pct,
+    lc.wetland_pct,
+    lc.water_ice_pct,
+    fh.fires_previous_7d,
+    fh.fires_previous_30d,
+    fh.fires_previous_365d,
+    fh.burned_area_previous_30d,
+    fh.burned_area_previous_365d,
+    fh.days_since_last_fire,
+        CASE
+            WHEN (EXISTS ( SELECT 1
+               FROM processed.fire_grid_final f
+              WHERE f.grid_id = g.grid_id AND f.discovery_date > d.prediction_date AND f.discovery_date <= (d.prediction_date + 7))) THEN 1
+            ELSE 0
+        END AS fire_next_7d
+   FROM processed.grid g
+     CROSS JOIN LATERAL ( SELECT gs.gs::date AS prediction_date
+           FROM generate_series('2000-01-01'::date::timestamp with time zone, '2023-12-24'::date::timestamp with time zone, '1 day'::interval) gs(gs)) d
+     LEFT JOIN LATERAL ( SELECT s.station_id,
+            st_distance(g.centroid_5070, s.geometry_5070) / 1000.0::double precision AS distance_km
+           FROM raw.weather_stations s
+             JOIN processed.weather_all_core_stations cs ON s.station_id = cs.station_id
+             JOIN processed.weather_complete_features wcf ON wcf.station_id::text = s.station_id AND wcf.date = d.prediction_date
+          ORDER BY (g.centroid_5070 <-> s.geometry_5070)
+         LIMIT 1) ws ON true
+     LEFT JOIN processed.weather_complete_features w ON w.station_id::text = ws.station_id AND w.date = d.prediction_date
+     LEFT JOIN LATERAL ( SELECT dw.drought_date,
+            dw.drought_value
+           FROM processed.drought_weekly dw
+          WHERE dw.grid_id = g.grid_id AND dw.drought_date <= d.prediction_date
+          ORDER BY dw.drought_date DESC
+         LIMIT 1) dr ON true
+     LEFT JOIN LATERAL ( SELECT lf.grid_id,
+            lf.year,
+            lf.forest_pct,
+            lf.shrub_pct,
+            lf.grassland_pct,
+            lf.cropland_pct,
+            lf.pasture_pct,
+            lf.developed_pct,
+            lf.barren_pct,
+            lf.wetland_pct,
+            lf.water_ice_pct
+           FROM processed.landcover_features lf
+          WHERE lf.grid_id = g.grid_id AND lf.year::numeric <= EXTRACT(year FROM d.prediction_date)
+          ORDER BY lf.year DESC
+         LIMIT 1) lc ON true
+     LEFT JOIN LATERAL ( SELECT COALESCE(sum(fgd.fire_count) FILTER (WHERE fgd.discovery_date >= (d.prediction_date - 7) AND fgd.discovery_date < d.prediction_date), 0::numeric) AS fires_previous_7d,
+            COALESCE(sum(fgd.fire_count) FILTER (WHERE fgd.discovery_date >= (d.prediction_date - 30) AND fgd.discovery_date < d.prediction_date), 0::numeric) AS fires_previous_30d,
+            COALESCE(sum(fgd.fire_count) FILTER (WHERE fgd.discovery_date >= (d.prediction_date - 365) AND fgd.discovery_date < d.prediction_date), 0::numeric) AS fires_previous_365d,
+            COALESCE(sum(fgd.burned_area_acres) FILTER (WHERE fgd.discovery_date >= (d.prediction_date - 30) AND fgd.discovery_date < d.prediction_date), 0::double precision) AS burned_area_previous_30d,
+            COALESCE(sum(fgd.burned_area_acres) FILTER (WHERE fgd.discovery_date >= (d.prediction_date - 365) AND fgd.discovery_date < d.prediction_date), 0::double precision) AS burned_area_previous_365d,
+            d.prediction_date - max(fgd.discovery_date) FILTER (WHERE fgd.discovery_date < d.prediction_date) AS days_since_last_fire
+           FROM processed.fire_grid_daily fgd
+          WHERE fgd.grid_id = g.grid_id AND fgd.discovery_date < d.prediction_date AND fgd.discovery_date >= (d.prediction_date - 365)) fh ON true;"
