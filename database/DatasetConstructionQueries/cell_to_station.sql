@@ -1,6 +1,5 @@
 CREATE EXTENSION IF NOT EXISTS btree_gist;
 
--- 1. Build the yearly complete stations once
 DROP TABLE IF EXISTS temp_yearly_complete_stations;
 CREATE TEMP TABLE temp_yearly_complete_stations AS
 WITH daily_filtered AS (
@@ -39,7 +38,6 @@ CREATE INDEX temp_yearly_stat_composite_idx
 ON temp_yearly_complete_stations USING gist(observation_year, geometry_5070);
 ANALYZE temp_yearly_complete_stations;
 
--- Safety check
 DO $$
 BEGIN
     IF (SELECT COUNT(*) FROM temp_yearly_complete_stations) = 0 THEN
@@ -47,7 +45,6 @@ BEGIN
     END IF;
 END $$;
 
--- 2. Create empty result table
 DROP TABLE IF EXISTS processed.grid_weather_stations_yearly;
 CREATE TABLE processed.grid_weather_stations_yearly (
     grid_id          integer,
@@ -59,7 +56,6 @@ CREATE TABLE processed.grid_weather_stations_yearly (
     distance_km      numeric(8,2)
 );
 
--- 3. Process one year at a time (much friendlier on 16 GB)
 DO $$
 DECLARE
     yr integer;
@@ -95,7 +91,6 @@ BEGIN
     END LOOP;
 END $$;
 
--- 4. Final index + cleanup
 CREATE INDEX idx_grid_weather_yearly 
 ON processed.grid_weather_stations_yearly (grid_id, observation_year);
 
