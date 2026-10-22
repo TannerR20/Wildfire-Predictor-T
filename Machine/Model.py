@@ -48,12 +48,12 @@ model.fit(
     verbose=100,
 )
 
-probabilities = model.predict_proba(X_valid)[:, 1]
+probabilities = model.predict_proba(X_validate)[:, 1]
 
 print("Features:", features)
-print("Validation prevalence:", y_valid.mean())
-print("Average precision:", average_precision_score(y_valid, probabilities))
-print("ROC-AUC:", roc_auc_score(y_valid, probabilities))
+print("Validation prevalence:", y_validate.mean())
+print("Average precision:", average_precision_score(y_validate, probabilities))
+print("ROC-AUC:", roc_auc_score(y_validate, probabilities))
 
 model.save_model("C:\Users\tanne\wildfire detector\Wildfire-Predictor\Machine")
 
