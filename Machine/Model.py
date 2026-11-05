@@ -23,6 +23,7 @@ features = [
     if columns not in exclude and columns in validate.columns
 ]
 
+
 X_train, y_train, X_validate, y_validate = train[features], train[target], validate[features], validate[target]
 
 model = XGBClassifier(
