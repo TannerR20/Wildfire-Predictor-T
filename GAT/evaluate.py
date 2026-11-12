@@ -10,10 +10,10 @@ from sklearn.metrics import (average_precision_score, roc_auc_score, precision_s
 from torch_geometric.loader import DataLoader
 
 try:
-    from .dataset import read_rows, GridTopology, SnapshotDataset
+    from .dataset import read_rows, GridTopology, SnapshotDataset, npz_paths, inspect_npz, NPZSnapshotDataset
     from .model import WildfireGAT
 except ImportError:
-    from dataset import read_rows, GridTopology, SnapshotDataset
+    from dataset import read_rows, GridTopology, SnapshotDataset, npz_paths, inspect_npz, NPZSnapshotDataset
     from model import WildfireGAT
 
 
@@ -24,7 +24,9 @@ def predict(model, dataset, device, batch_size=32):
     for batch in DataLoader(dataset, batch_size=batch_size, shuffle=False):
         rows = batch.row_id.numpy()
         batch = batch.to(device)
-        probabilities[rows] = model(batch.x, batch.edge_index).sigmoid().cpu().numpy()
+        selected = rows >= 0
+        scores = model(batch.x, batch.edge_index).sigmoid().cpu().numpy()
+        probabilities[rows[selected]] = scores[selected]
     return probabilities
 
 
@@ -50,10 +52,10 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--checkpoint', required=True)
     parser.add_argument('--data', required=True)
-    parser.add_argument('--grid', required=True)
+    parser.add_argument('--grid', help='Required only for CSV checkpoints.')
     parser.add_argument('--output', default='artifacts/gat/evaluation')
     parser.add_argument('--threshold', type=float, default=0.5)
-    parser.add_argument('--batch-size', type=int, default=32)
+    parser.add_argument('--batch-size', type=int, default=1)
     parser.add_argument('--allow-edgeless', action='store_true')
     args = parser.parse_args()
     if not 0 <= args.threshold <= 1:
@@ -61,9 +63,18 @@ def main():
     torch.set_num_threads(4)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     checkpoint = torch.load(args.checkpoint, map_location='cpu', weights_only=True)
-    frame = read_rows(args.data)
-    topology = GridTopology(args.grid, checkpoint['k'], checkpoint['cell_size'])
-    dataset = SnapshotDataset(frame, checkpoint['preprocessor'], topology, args.allow_edgeless)
+    if args.batch_size < 1:
+        parser.error('batch-size must be positive')
+    if checkpoint.get('input_format', 'csv') == 'npz':
+        metadata, _ = inspect_npz(npz_paths(args.data))
+        dataset = NPZSnapshotDataset([p for p,_ in metadata], checkpoint['preprocessor'], args.allow_edgeless)
+        frame = dataset.frame
+    else:
+        if not args.grid:
+            parser.error('--grid is required for CSV checkpoints.')
+        frame = read_rows(args.data)
+        topology = GridTopology(args.grid, checkpoint['k'], checkpoint['cell_size'])
+        dataset = SnapshotDataset(frame, checkpoint['preprocessor'], topology, args.allow_edgeless)
     model = WildfireGAT(**checkpoint['model_config']).to(device)
     model.load_state_dict(checkpoint['state_dict'])
     probabilities = predict(model, dataset, device, args.batch_size)
