@@ -149,3 +149,166 @@ class SnapshotDataset(Dataset):
         return Data(x=torch.from_numpy(self.x[indices]), edge_index=self.edges[index],
                     y=torch.tensor(np.nan_to_num(labels), dtype=torch.float32),
                     label_mask=torch.tensor(mask), row_id=torch.tensor(indices, dtype=torch.long))
+
+
+def npz_paths(path):
+    """A daily NPZ file or a directory containing daily NPZs, recursively."""
+    from pathlib import Path
+    path = Path(path)
+    paths = sorted(path.rglob('*.npz')) if path.is_dir() else [path]
+    if not paths or any(p.suffix.lower() != '.npz' for p in paths):
+        raise ValueError(f'Expected an NPZ file or nonempty NPZ directory: {path}')
+    return paths
+
+
+def read_npz(path):
+    """Validate local indices. Never use global_node_idx as a tensor index."""
+    with np.load(path, allow_pickle=False) as archive:
+        required = {'x', 'edge_index', 'grid_id', 'label_node_idx', 'y',
+                    'feature_names', 'prediction_date', 'split'}
+        if not required.issubset(archive.files):
+            raise ValueError(f'{path}: missing arrays {sorted(required-set(archive.files))}')
+        data = {key: archive[key] for key in required}
+    x, edges, labels, ids, y = (data[k] for k in ('x','edge_index','label_node_idx','grid_id','y'))
+    if x.ndim != 2 or len(x) == 0 or x.dtype.kind not in 'fiu':
+        raise ValueError(f'{path}: x must be a nonempty numeric [nodes, features] array.')
+    names = data['feature_names']
+    if names.ndim != 1 or names.dtype.kind not in 'US' or len(names) != x.shape[1] or len(set(names)) != len(names):
+        raise ValueError(f'{path}: feature_names must uniquely name every x column.')
+    if ids.shape != (len(x),) or len(np.unique(ids)) != len(x) or pd.isna(ids).any():
+        raise ValueError(f'{path}: grid_id must uniquely identify each node.')
+    if edges.ndim != 2 or edges.shape[0] != 2 or edges.dtype.kind not in 'iu':
+        raise ValueError(f'{path}: edge_index must be integer [2, edges].')
+    if edges.size and (edges.min() < 0 or edges.max() >= len(x)):
+        raise ValueError(f'{path}: edge_index contains out-of-range local node indices.')
+    if labels.ndim != 1 or labels.dtype.kind not in 'iu' or len(np.unique(labels)) != len(labels):
+        raise ValueError(f'{path}: label_node_idx must be unique integer indices.')
+    if labels.size and (labels.min() < 0 or labels.max() >= len(x)):
+        raise ValueError(f'{path}: label_node_idx contains out-of-range local indices.')
+    if y.shape != labels.shape or y.dtype.kind not in 'fiu' or not np.isin(y[~np.isnan(y)], [0,1]).all():
+        raise ValueError(f'{path}: y must match label_node_idx and contain 0/1 or NaN.')
+    if data['prediction_date'].shape != () or data['split'].shape != ():
+        raise ValueError(f'{path}: prediction_date and split must be scalar arrays.')
+    date = pd.Timestamp(str(data['prediction_date'].item())).normalize()
+    if pd.isna(date):
+        raise ValueError(f'{path}: missing prediction date.')
+    data['date'] = date
+    data['split_name'] = str(data['split'].item()).lower()
+    return data
+
+
+def inspect_npz(paths, expected_split=None):
+    """Check schemas and split tags before fitting; retain only small metadata."""
+    aliases = {'train': {'train','training'}, 'validation': {'validation','validate','valid','val'}}
+    metadata = []
+    names = None
+    for path in paths:
+        data = read_npz(path)
+        current = data['feature_names'].tolist()
+        if names is not None and current != names:
+            raise ValueError(f'{path}: inconsistent feature_names/order across daily graphs.')
+        names = current
+        if expected_split and data['split_name'] not in aliases[expected_split]:
+            raise ValueError(f'{path}: split={data["split_name"]!r}, expected {expected_split}.')
+        metadata.append((path, data['date']))
+    if len({date for _, date in metadata}) != len(metadata):
+        raise ValueError('Expected one NPZ graph per prediction date; duplicate dates found.')
+    return sorted(metadata, key=lambda item: item[1]), names
+
+
+def fit_npz_preprocessor(paths, features):
+    """Streaming training-only mean imputation/scaling over all context nodes.
+
+    Merge per-file moments to avoid retaining every training graph in memory.
+    Missingness indicators are appended by transform(), as for CSV data.
+    """
+    count = np.zeros(len(features), dtype=np.float64)
+    mean = np.zeros(len(features), dtype=np.float64)
+    m2 = np.zeros(len(features), dtype=np.float64)
+    for path in paths:
+        data = read_npz(path)
+        names = data['feature_names'].tolist()
+        values = data['x'][:, [names.index(c) for c in features]].astype(np.float64)
+        for j in range(len(features)):
+            column = values[:, j]
+            column = column[np.isfinite(column)]
+            n = len(column)
+            if not n:
+                continue
+            delta = column.mean() - mean[j]
+            total = count[j] + n
+            m2[j] += ((column-column.mean())**2).sum() + delta**2 * count[j] * n / total
+            mean[j] += delta*n/total
+            count[j] = total
+    missing = [features[j] for j in range(len(features)) if count[j] == 0]
+    if missing:
+        warnings.warn(f'Entirely missing training predictors; filling with zero: {missing}')
+    variance = np.divide(m2, count, out=np.zeros_like(m2), where=count > 0)
+    scales = np.sqrt(variance)
+    scales[scales == 0] = 1
+    return {'features': features, 'medians': mean.tolist(), 'means': mean.tolist(),
+            'scales': scales.tolist(), 'imputation': 'training_mean',
+            'all_missing_training_features': missing}
+
+
+class NPZSnapshotDataset(Dataset):
+    """Lazy daily graphs: all context nodes participate, only supplied labels train."""
+    def __init__(self, paths, prep, allow_edgeless=False):
+        self.paths = list(paths)
+        self.prep = prep
+        self.offsets = []
+        frames = []
+        nodes = edges = connected = missing = elements = 0
+        for path in self.paths:
+            data = read_npz(path)
+            names = data['feature_names'].tolist()
+            if not set(prep['features']).issubset(names):
+                raise ValueError(f'{path}: missing predictors required by checkpoint.')
+            indices = data['label_node_idx']
+            self.offsets.append(sum(len(f) for f in frames))
+            frames.append(pd.DataFrame({'grid_id': data['grid_id'][indices],
+                                        'prediction_date': data['date'],
+                                        TARGET: data['y']}))
+            n = len(data['x'])
+            nodes += n
+            spatial = data['edge_index'][:, data['edge_index'][0] != data['edge_index'][1]]
+            edges += spatial.shape[1]
+            connected += len(np.unique(spatial))
+            selected = data['x'][:, [names.index(c) for c in prep['features']]]
+            missing += int((~np.isfinite(selected)).sum())
+            elements += selected.size
+        if not frames:
+            raise ValueError('No NPZ graphs remain.')
+        self.frame = pd.concat(frames, ignore_index=True)
+        if self.frame.duplicated(['grid_id','prediction_date']).any():
+            raise ValueError('Duplicate labeled cell/date keys across NPZ files.')
+        if not self.frame[TARGET].notna().any():
+            raise ValueError('No known labels in NPZ dataset.')
+        self.stats = {'snapshots': len(self.paths), 'node_observations': nodes,
+                      'prediction_rows': len(self.frame), 'directed_spatial_edges': edges,
+                      'connected_node_fraction': connected/nodes,
+                      'missing_feature_fraction': missing/elements}
+        if edges == 0 and not allow_edgeless:
+            raise ValueError('No spatial edges in NPZ graphs; use --allow-edgeless only for diagnostics.')
+        if missing:
+            warnings.warn(f'NPZ missing/nonfinite feature fraction: {missing/elements:.2%}; using training imputation.')
+
+    def __len__(self):
+        return len(self.paths)
+
+    def __getitem__(self, index):
+        data = read_npz(self.paths[index])
+        n = len(data['x'])
+        values = pd.DataFrame(data['x'], columns=data['feature_names'])
+        x = transform(values, self.prep)
+        selected = data['label_node_idx']
+        labels = np.zeros(n, dtype=np.float32)
+        labels[selected] = np.nan_to_num(data['y'], nan=0)
+        mask = np.zeros(n, dtype=bool)
+        mask[selected] = np.isfinite(data['y'])
+        # row_id does not contain 'index', so PyG will not shift it during batching.
+        rows = np.full(n, -1, dtype=np.int64)
+        rows[selected] = np.arange(len(selected)) + self.offsets[index]
+        return Data(x=torch.from_numpy(x), edge_index=torch.tensor(data['edge_index'], dtype=torch.long),
+                    y=torch.from_numpy(labels), label_mask=torch.from_numpy(mask),
+                    row_id=torch.from_numpy(rows))
