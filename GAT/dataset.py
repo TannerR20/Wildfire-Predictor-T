@@ -192,8 +192,8 @@ def read_npz(path):
     date = pd.Timestamp(str(data['prediction_date'].item())).normalize()
     if pd.isna(date):
         raise ValueError(f'{path}: missing prediction date.')
-    data['date'] = date
-    data['split_name'] = str(data['split'].item()).lower()
+    data['prediction_date'] = date
+    data['split'] = str(data['split'].item()).lower()
     return data
 
 
@@ -208,9 +208,9 @@ def inspect_npz(paths, expected_split=None):
         if names is not None and current != names:
             raise ValueError(f'{path}: inconsistent feature_names/order across daily graphs.')
         names = current
-        if expected_split and data['split_name'] not in aliases[expected_split]:
+        if expected_split and data['split'] not in aliases[expected_split]:
             raise ValueError(f'{path}: split={data["split_name"]!r}, expected {expected_split}.')
-        metadata.append((path, data['date']))
+        metadata.append((path, data['prediction_date']))
     if len({date for _, date in metadata}) != len(metadata):
         raise ValueError('Expected one NPZ graph per prediction date; duplicate dates found.')
     return sorted(metadata, key=lambda item: item[1]), names
@@ -267,7 +267,7 @@ class NPZSnapshotDataset(Dataset):
             indices = data['label_node_idx']
             self.offsets.append(sum(len(f) for f in frames))
             frames.append(pd.DataFrame({'grid_id': data['grid_id'][indices],
-                                        'prediction_date': data['date'],
+                                        'prediction_date': data['prediction_date'],
                                         TARGET: data['y']}))
             n = len(data['x'])
             nodes += n
